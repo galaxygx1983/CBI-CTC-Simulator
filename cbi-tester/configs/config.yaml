@@ -1,0 +1,35 @@
+# configs/config.yaml
+server:
+  mode: grpc  # tcp/serial/pipe/grpc
+  tcp:
+    port: 8001
+  serial:
+    port: COM4
+    baud_rate: 19200
+    data_bits: 8
+    parity: none
+    stop_bits: 1
+  pipe:
+    name: cbi_sim
+
+grpc:
+  address: "localhost:50051"
+  timeout_ms: 30000
+  max_retry: 3
+  insecure: true
+
+protocol:
+  version: 0x11
+  ack_timeout_ms: 500
+  max_retry: 3
+  heartbeat_ms: 500
+
+station:
+  codebit_file: ..\configs\lgxtq.zl
+  error_file: ..\configs\Error.sys
+  initial_state: safe
+
+logging:
+  level: info
+  run_log: logs/cbi-sim.log
+  frame_log: logs/ZLEvents  # 报文日志，格式类似ZLEvents260211

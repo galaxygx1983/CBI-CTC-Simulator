@@ -1,0 +1,178 @@
+// api/proto/cbi/v1/cbi.proto
+syntax = "proto3";
+
+package cbi.v1;
+
+option go_package = "cbi-simulator/internal/pb/cbi/v1;cbiv1";
+
+// ========== 消息定义 ==========
+
+// 空消息
+message Empty {}
+
+// 帧类型枚举
+enum FrameType {
+  FRAME_TYPE_UNSPECIFIED = 0;
+  // 通信控制帧
+  FRAME_TYPE_DC2 = 18;    // 0x12 - 连接请求
+  FRAME_TYPE_DC3 = 19;    // 0x13 - 连接确认
+  FRAME_TYPE_ACK = 6;     // 0x06 - 应答/心跳
+  FRAME_TYPE_NACK = 21;   // 0x15 - 否定应答
+  FRAME_TYPE_VERROR = 16; // 0x10 - 版本错误
+  // 数据传送帧
+  FRAME_TYPE_SDCI = 138;  // 0x8A - 站场数据变化(增量)
+  FRAME_TYPE_SDI = 133;   // 0x85 - 站场完整数据(全量)
+  FRAME_TYPE_SDIQ = 106;  // 0x6A - 站场数据请求
+  FRAME_TYPE_FIR = 101;   // 0x65 - 故障信息报告
+  FRAME_TYPE_RSR = 170;   // 0xAA - 系统工作状态报告
+  FRAME_TYPE_BCC = 149;   // 0x95 - 按钮控制命令
+  FRAME_TYPE_ACQ = 117;   // 0x75 - 自律控制请求
+  FRAME_TYPE_ACA = 122;   // 0x7A - 自律控制同意
+  FRAME_TYPE_TSQ = 154;   // 0x9A - 时间同步请求
+  FRAME_TYPE_TSD = 165;   // 0xA5 - 时间同步数据
+}
+
+// 帧消息
+message Frame {
+  bytes header = 1;        // 帧头 0x7D
+  uint32 header_len = 2;   // 首部长度
+  uint32 version = 3;      // 协议版本
+  uint32 send_seq = 4;     // 发送序号
+  uint32 ack_seq = 5;      // 确认序号
+  FrameType type = 6;      // 帧类型
+
+  // 以下字段仅对数据帧有效（控制帧无此字段）
+  optional uint32 data_length = 7;
+  optional bytes data = 8;
+
+  uint32 crc = 9;          // CRC校验
+  bytes tail = 10;         // 帧尾 0x7E
+}
+
+// 帧请求
+message FrameRequest {
+  Frame frame = 1;
+}
+
+// 帧响应
+message FrameResponse {
+  Frame frame = 1;
+  string error = 2;
+}
+
+// 设备类型
+enum DeviceType {
+  DEVICE_TYPE_UNSPECIFIED = 0;
+  DEVICE_TYPE_TURNOUT = 1;
+  DEVICE_TYPE_SIGNAL = 2;
+  DEVICE_TYPE_SECTION = 3;
+}
+
+// 设备请求
+message DeviceRequest {
+  uint32 index = 1;
+  string name = 2;
+}
+
+// 设备状态
+message DeviceState {
+  uint32 index = 1;
+  string name = 2;
+  DeviceType type = 3;
+  bytes state = 4;
+  string description = 5;
+}
+
+// 设置设备状态请求
+message SetDeviceRequest {
+  uint32 index = 1;
+  bytes state = 2;
+}
+
+// 设置设备状态响应
+message SetDeviceResponse {
+  bool success = 1;
+  string error = 2;
+  DeviceState new_state = 3;
+}
+
+// 所有设备状态
+message AllDeviceStates {
+  repeated DeviceState devices = 1;
+}
+
+// 角色类型
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_MASTER = 1;
+  ROLE_BACKUP = 2;
+}
+
+// 设置角色请求
+message SetRoleRequest {
+  Role role = 1;
+}
+
+// 角色响应
+message RoleResponse {
+  Role role = 1;
+  bool success = 2;
+}
+
+// 场景
+message Scenario {
+  string name = 1;
+  string description = 2;
+  repeated DeviceState initial_states = 3;
+  repeated FrameAction actions = 4;
+}
+
+// 帧动作
+message FrameAction {
+  int64 delay_ms = 1;
+  Frame send_frame = 2;
+  Frame expect_frame = 3;
+}
+
+// 场景请求
+message ScenarioRequest {
+  oneof request {
+    string load_name = 1;
+    Scenario save_scenario = 2;
+    string delete_name = 3;
+  }
+}
+
+// 场景响应
+message ScenarioResponse {
+  bool success = 1;
+  string error = 2;
+  Scenario scenario = 3;
+}
+
+// 场景列表响应
+message ScenarioListResponse {
+  repeated string names = 1;
+}
+
+// ========== 服务定义 ==========
+
+service CBISimulator {
+  // 双向流：帧收发（主通信通道）
+  rpc FrameStream(stream FrameRequest) returns (stream FrameResponse);
+
+  // 设备状态管理
+  rpc GetDeviceState(DeviceRequest) returns (DeviceState);
+  rpc SetDeviceState(SetDeviceRequest) returns (SetDeviceResponse);
+  rpc GetAllDeviceStates(Empty) returns (AllDeviceStates);
+
+  // 角色控制
+  rpc SetRole(SetRoleRequest) returns (RoleResponse);
+  rpc GetRole(Empty) returns (RoleResponse);
+
+  // 场景管理
+  rpc LoadScenario(ScenarioRequest) returns (ScenarioResponse);
+  rpc SaveScenario(ScenarioRequest) returns (ScenarioResponse);
+  rpc DeleteScenario(ScenarioRequest) returns (ScenarioResponse);
+  rpc ListScenarios(Empty) returns (ScenarioListResponse);
+}

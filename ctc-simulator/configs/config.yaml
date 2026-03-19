@@ -1,0 +1,8 @@
+server:
+  grpc:
+    address: ":50051"
+    timeout: 30s
+
+logging:
+  level: "info"
+  format: "text"

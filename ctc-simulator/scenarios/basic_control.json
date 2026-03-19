@@ -1,0 +1,24 @@
+{
+  "name": "basic_control",
+  "description": "基础控制命令场景",
+  "actions": [
+    {
+      "delay_ms": 5000,
+      "type": "BCC",
+      "device_index": 256,
+      "command": "TURNOUT_NORMAL"
+    },
+    {
+      "delay_ms": 10000,
+      "type": "BCC",
+      "device_index": 257,
+      "command": "TURNOUT_REVERSE"
+    },
+    {
+      "delay_ms": 15000,
+      "type": "BCC",
+      "device_index": 512,
+      "command": "SIGNAL_OPEN"
+    }
+  ]
+}
