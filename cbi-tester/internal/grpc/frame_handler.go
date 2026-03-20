@@ -77,6 +77,9 @@ type FrameHandler struct {
 	// 延时发送控制
 	delayTimer *time.Timer
 
+	// 故障注入支持
+	customAckTimeout time.Duration // 自定义 ACK 超时时间（0 表示使用默认值）
+
 	// 回调函数
 	onDC2  func(*protocol.Frame)
 	onDC3  func(*protocol.Frame)
@@ -151,10 +154,21 @@ func (h *FrameHandler) ackTimerLoop() {
 	}
 }
 
-// updateNextFrameSendTime 更新下一帧发送时间（接收时间 + 490ms）
+// updateNextFrameSendTime 更新下一帧发送时间（接收时间 + 490ms 或自定义超时）
 func (h *FrameHandler) updateNextFrameSendTime() {
 	h.nextFrameMu.Lock()
-	h.nextFrameSendTime = time.Now().Add(490 * time.Millisecond)
+	defer h.nextFrameMu.Unlock()
+	timeout := 490 * time.Millisecond // 默认超时
+	if h.customAckTimeout > 0 {
+		timeout = h.customAckTimeout
+	}
+	h.nextFrameSendTime = time.Now().Add(timeout)
+}
+
+// SetAckTimeout 设置 ACK 超时时间（用于故障注入）
+func (h *FrameHandler) SetAckTimeout(timeout time.Duration) {
+	h.nextFrameMu.Lock()
+	h.customAckTimeout = timeout
 	h.nextFrameMu.Unlock()
 }
 

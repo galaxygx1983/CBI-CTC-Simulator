@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"cbi-simulator/cmd/cbi-client/fault"
 	"cbi-simulator/internal/grpc"
 	"cbi-simulator/internal/logger"
 	"cbi-simulator/internal/protocol"
@@ -34,6 +35,10 @@ func init() {
 	connectCmd.Flags().IntVarP(&connectTimeout, "timeout", "t", 30, "connection timeout in seconds")
 	connectCmd.Flags().StringVarP(&logDir, "log-dir", "l", "logs", "log directory path")
 	connectCmd.Flags().StringVarP(&configDir, "config", "c", "configs", "config directory path")
+
+	// 注册故障注入参数
+	faultConfig := fault.NewFaultConfig()
+	faultConfig.RegisterFlags(connectCmd)
 }
 
 var connectCmd = &cobra.Command{
@@ -150,6 +155,18 @@ func generateRandomData(length int) []byte {
 }
 
 func runConnect(cmd *cobra.Command, args []string) {
+	// 创建故障注入器（无任何 --fault-* 参数时为 nil，保证零侵入）
+	injector, err := fault.NewFaultInjectorOrNil(cmd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create fault injector: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 打印启用的故障注入配置
+	if injector != nil {
+		fmt.Printf("[FAULT INJECTION ENABLED] %s\n", injector.Config().String())
+	}
+
 	// 初始化日志文件
 	logPath := filepath.Join(logDir, time.Now().Format("ZLEvents060102"))
 	frameLogger, err := logger.NewLogger(&logger.Config{
@@ -179,10 +196,25 @@ func runConnect(cmd *cobra.Command, args []string) {
 	// 获取 handler
 	handler := client.GetHandler()
 
+	// 设置自定义 ACK 超时（如果启用）
+	if injector != nil {
+		handler.SetAckTimeout(injector.GetAckTimeout())
+	}
+
 	// 设置帧发送回调 - 记录发送日志
 	client.SetOnFrameSent(func(frame *protocol.Frame) {
+		// 故障注入 BeforeSend（版本篡改、数据长度篡改）
+		if injector != nil {
+			injector.BeforeSend(frame)
+		}
+
 		frameData := protocol.FrameToBytes(frame)
 		frameLogger.LogFrameSend(byte(frame.Type), frameData)
+
+		// 故障注入 AfterSend（序号跳跃控制）
+		if injector != nil {
+			injector.AfterSend(frame)
+		}
 	})
 
 	// === 帧处理回调 ===
@@ -198,8 +230,30 @@ func runConnect(cmd *cobra.Command, args []string) {
 		cbiState.controlMode = 0xAA // 非常站控
 		cbiState.mu.Unlock()
 
-		// 延时10ms回复DC3
-		time.Sleep(10 * time.Millisecond)
+		// 故障注入：阻断 DC3
+		if injector != nil && injector.ShouldBlockDC2() {
+			fmt.Println("[FAULT] DC2 blocked, no DC3 reply")
+			return
+		}
+
+		// 故障注入：回复 VERROR
+		if injector != nil && injector.ShouldSendVerrorOnDC2() {
+			fmt.Println("[FAULT] Sending VERROR on DC2")
+			if err := handler.SendVERROR(); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to send VERROR: %v\n", err)
+			}
+			handler.Disconnect()
+			return
+		}
+
+		// 故障注入：获取回复延时
+		delay := 10 * time.Millisecond
+		if injector != nil {
+			delay = injector.GetReplyDelay()
+		}
+
+		// 延时回复DC3
+		time.Sleep(delay)
 		if err := handler.SendDC3(); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to send DC3: %v\n", err)
 		} else {
@@ -207,18 +261,37 @@ func runConnect(cmd *cobra.Command, args []string) {
 		}
 	})
 
-	// 2. RSR: 延时10ms回复RSR
+	// 2. RSR: 延时回复RSR
 	handler.OnRSR(func(frame *protocol.Frame) {
+		// 故障注入：ReplyDrop
+		if injector != nil && injector.ShouldReplyDrop() {
+			fmt.Println("[FAULT] RSR reply dropped")
+			return
+		}
+		if injector != nil && injector.ShouldEmptyData() {
+			fmt.Println("[FAULT] RSR sending empty data")
+		}
+
 		cbiState.mu.Lock()
 		role := cbiState.roleState
 		mode := cbiState.controlMode
 		cbiState.mu.Unlock()
 
-		// 延时10ms回复RSR
-		time.Sleep(10 * time.Millisecond)
+		// 故障注入：获取回复延时
+		delay := 10 * time.Millisecond
+		if injector != nil {
+			delay = injector.GetReplyDelay()
+		}
+
+		time.Sleep(delay)
+
+		replyData := []byte{role, mode}
+		if injector != nil && injector.ShouldEmptyData() {
+			replyData = nil
+		}
 
 		if err := handler.SendDataFrame(protocol.RSR, func() []byte {
-			return []byte{role, mode}
+			return replyData
 		}); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to send RSR: %v\n", err)
 		} else {
@@ -227,12 +300,6 @@ func runConnect(cmd *cobra.Command, args []string) {
 	})
 
 	// 3. ACK: 根据ACK计数器响应
-	// 3.1 ACK计数器=1 → 回复SDI
-	// 3.2 ACK计数器=2 → 回复ACQ
-	// 3.3 ACK计数器=10 → 回复TSQ
-	// 3.4 ACK计数器>10且为3的倍数 → 回复SDCI
-	// 3.5 ACK计数器>10且为5的倍数 → 回复FIR
-	// 注：3.6已移除，ACK通过500ms定时器机制发送
 	handler.OnACK(func(frame *protocol.Frame) {
 		cbiState.mu.Lock()
 		cbiState.ackCount++
@@ -241,12 +308,32 @@ func runConnect(cmd *cobra.Command, args []string) {
 
 		fmt.Printf("Received ACK (count=%d, ackSeq=%d)\n", count, frame.AckSeq)
 
+		// 故障注入：阻断回复
+		if injector != nil && injector.ShouldReplyDrop() {
+			fmt.Println("[FAULT] ACK reply dropped")
+			return
+		}
+
+		// 故障注入：NackAfter
+		if injector != nil && injector.ShouldSendNackAfter() {
+			fmt.Println("[FAULT] Injecting NACK instead of reply")
+			handler.SendNACK()
+			return
+		}
+
+		// 故障注入：空数据
+		emptyData := injector != nil && injector.ShouldEmptyData()
+
 		switch {
 		case count == 1:
 			// 回复SDI（完整站场数据）
 			fmt.Printf("ACK count=1: sending SDI\n")
+			data := cbiState.GenerateSDIData()
+			if emptyData {
+				data = nil
+			}
 			if err := handler.SendDataFrame(protocol.SDI, func() []byte {
-				return cbiState.GenerateSDIData()
+				return data
 			}); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to send SDI: %v\n", err)
 			}
@@ -254,8 +341,12 @@ func runConnect(cmd *cobra.Command, args []string) {
 		case count == 2:
 			// 回复ACQ（请求自律控制）
 			fmt.Printf("ACK count=2: sending ACQ\n")
+			data := []byte{0x55} // 请求自律控制
+			if emptyData {
+				data = nil
+			}
 			if err := handler.SendDataFrame(protocol.ACQ, func() []byte {
-				return []byte{0x55} // 请求自律控制
+				return data
 			}); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to send ACQ: %v\n", err)
 			}
@@ -263,8 +354,12 @@ func runConnect(cmd *cobra.Command, args []string) {
 		case count == 10:
 			// 回复TSQ（时间同步请求）
 			fmt.Printf("ACK count=10: sending TSQ\n")
+			var data []byte
+			if emptyData {
+				data = nil
+			}
 			if err := handler.SendDataFrame(protocol.TSQ, func() []byte {
-				return nil
+				return data
 			}); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to send TSQ: %v\n", err)
 			}
@@ -272,8 +367,12 @@ func runConnect(cmd *cobra.Command, args []string) {
 		case count > 10 && count%3 == 0:
 			// 回复SDCI（增量数据）
 			fmt.Printf("ACK count=%d: sending SDCI\n", count)
+			data := cbiState.GenerateSDCIData()
+			if emptyData {
+				data = nil
+			}
 			if err := handler.SendDataFrame(protocol.SDCI, func() []byte {
-				return cbiState.GenerateSDCIData()
+				return data
 			}); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to send SDCI: %v\n", err)
 			}
@@ -281,8 +380,12 @@ func runConnect(cmd *cobra.Command, args []string) {
 		case count > 10 && count%5 == 0:
 			// 回复FIR（故障报告）
 			fmt.Printf("ACK count=%d: sending FIR\n", count)
+			data := cbiState.GenerateFIRData()
+			if emptyData {
+				data = nil
+			}
 			if err := handler.SendDataFrame(protocol.FIR, func() []byte {
-				return cbiState.GenerateFIRData()
+				return data
 			}); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to send FIR: %v\n", err)
 			}
@@ -290,7 +393,7 @@ func runConnect(cmd *cobra.Command, args []string) {
 		// 其他情况不发送任何帧，等待500ms定时器触发ACK
 	})
 
-	// 4. ACA: 如果同意自律控制，更新控制模式，延时10ms回复ACK
+	// 4. ACA: 如果同意自律控制，更新控制模式
 	handler.OnACA(func(frame *protocol.Frame) {
 		if len(frame.Data) > 0 && frame.Data[0] == 0x55 {
 			cbiState.mu.Lock()
@@ -314,9 +417,22 @@ func runConnect(cmd *cobra.Command, args []string) {
 	// 7. SDIQ: 延时10ms回复SDI
 	handler.OnSDIQ(func(frame *protocol.Frame) {
 		fmt.Println("Received SDIQ: station data request")
-		time.Sleep(10 * time.Millisecond)
+
+		// 故障注入：获取回复延时
+		delay := 10 * time.Millisecond
+		if injector != nil {
+			delay = injector.GetReplyDelay()
+		}
+
+		time.Sleep(delay)
+
+		data := cbiState.GenerateSDIData()
+		if injector != nil && injector.ShouldEmptyData() {
+			data = nil
+		}
+
 		if err := handler.SendDataFrame(protocol.SDI, func() []byte {
-			return cbiState.GenerateSDIData()
+			return data
 		}); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to send SDI: %v\n", err)
 		}
@@ -324,9 +440,29 @@ func runConnect(cmd *cobra.Command, args []string) {
 
 	// 设置帧接收回调 - 记录日志
 	client.SetOnFrameReceived(func(frame *protocol.Frame) {
+		// 故障注入 BeforeRecv（丢帧 / 随机 NACK）
+		if injector != nil {
+			result := injector.BeforeRecv(frame)
+			if result.Block {
+				fmt.Printf("[FAULT] Frame %s dropped\n", frame.Type)
+				return
+			}
+			if result.Nack {
+				fmt.Printf("[FAULT] Frame %s replaced with NACK\n", frame.Type)
+				handler.SendNACK()
+				return
+			}
+		}
+
+		// 正常日志记录
 		frameData := protocol.FrameToBytes(frame)
 		frameLogger.LogFrameRecv(byte(frame.Type), frameData)
 		fmt.Printf("Received frame: %s (seq=%d, ack=%d)\n", frame.Type, frame.SendSeq, frame.AckSeq)
+
+		// 故障注入 AfterRecvCheck（数据篡改）
+		if injector != nil {
+			injector.AfterRecvCheck(frame)
+		}
 	})
 
 	// 设置错误回调
@@ -346,6 +482,32 @@ func runConnect(cmd *cobra.Command, args []string) {
 	fmt.Println("Connected successfully!")
 	fmt.Println("Press Ctrl+C to disconnect")
 
+	// 故障注入：主动断连定时器
+	if injector != nil && injector.ShouldDisconnect() {
+		go func() {
+			disconnectTimer := time.NewTimer(injector.GetDisconnectAfter())
+			<-disconnectTimer.C
+			fmt.Println("[FAULT] Triggering disconnect")
+			injector.RecordDisconnect()
+			client.Disconnect()
+
+			if injector.ShouldReconnectLoop() {
+				fmt.Println("[FAULT] Reconnecting loop...")
+				for {
+					time.Sleep(3 * time.Second)
+					fmt.Println("[FAULT] Attempting reconnect...")
+					if err := client.Connect(ctx); err != nil {
+						fmt.Fprintf(os.Stderr, "[FAULT] Reconnect failed: %v\n", err)
+						continue
+					}
+					fmt.Println("[FAULT] Reconnected successfully!")
+					// 重新设置断连定时器
+					break
+				}
+			}
+		}()
+	}
+
 	// 等待中断信号
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -358,4 +520,9 @@ func runConnect(cmd *cobra.Command, args []string) {
 	}
 
 	fmt.Println("Disconnected")
+
+	// 打印故障统计
+	if injector != nil {
+		fmt.Printf("[FAULT STATS] %s\n", injector.Stats().String())
+	}
 }
