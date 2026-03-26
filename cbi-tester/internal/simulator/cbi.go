@@ -245,17 +245,21 @@ func (s *CBISimulator) handleDC2(frame *protocol.Frame) {
 
 	s.connected = true
 
-	// 延时10ms发送DC3
+	// 延时10ms发送DC3，然后延时1ms发送RSR
 	time.AfterFunc(10*time.Millisecond, func() {
 		s.sendDC3()
+		// 发送DC3后延时1ms发送RSR
+		time.AfterFunc(1*time.Millisecond, func() {
+			s.sendRSR()
+		})
 	})
 }
 
 // handleRSR 处理RSR系统工作状态请求
-// 延时10毫秒回复RSR（根据主备状态变量和控制模式变量填充报文）
+// 延时10毫秒回复ACK（不再回复RSR）
 func (s *CBISimulator) handleRSR(frame *protocol.Frame) {
 	time.AfterFunc(10*time.Millisecond, func() {
-		s.sendRSR()
+		s.sendACK()
 	})
 }
 

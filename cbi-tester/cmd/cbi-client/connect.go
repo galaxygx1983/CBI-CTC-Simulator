@@ -259,23 +259,29 @@ func runConnect(cmd *cobra.Command, args []string) {
 		} else {
 			fmt.Printf("Sent DC3 (seq initialized to 1)\n")
 		}
+
+		// 发送DC3后延时1ms发送RSR
+		time.Sleep(1 * time.Millisecond)
+		cbiState.mu.Lock()
+		role := cbiState.roleState
+		mode := cbiState.controlMode
+		cbiState.mu.Unlock()
+		if err := handler.SendDataFrame(protocol.RSR, func() []byte {
+			return []byte{role, mode}
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to send RSR: %v\n", err)
+		} else {
+			fmt.Printf("Sent RSR (role=0x%02X, mode=0x%02X)\n", role, mode)
+		}
 	})
 
-	// 2. RSR: 延时回复RSR
+	// 2. RSR: 延时10ms回复ACK
 	handler.OnRSR(func(frame *protocol.Frame) {
 		// 故障注入：ReplyDrop
 		if injector != nil && injector.ShouldReplyDrop() {
 			fmt.Println("[FAULT] RSR reply dropped")
 			return
 		}
-		if injector != nil && injector.ShouldEmptyData() {
-			fmt.Println("[FAULT] RSR sending empty data")
-		}
-
-		cbiState.mu.Lock()
-		role := cbiState.roleState
-		mode := cbiState.controlMode
-		cbiState.mu.Unlock()
 
 		// 故障注入：获取回复延时
 		delay := 10 * time.Millisecond
@@ -285,17 +291,10 @@ func runConnect(cmd *cobra.Command, args []string) {
 
 		time.Sleep(delay)
 
-		replyData := []byte{role, mode}
-		if injector != nil && injector.ShouldEmptyData() {
-			replyData = nil
-		}
-
-		if err := handler.SendDataFrame(protocol.RSR, func() []byte {
-			return replyData
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to send RSR: %v\n", err)
+		if err := handler.SendACK(); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to send ACK: %v\n", err)
 		} else {
-			fmt.Printf("Sent RSR (role=0x%02X, mode=0x%02X)\n", role, mode)
+			fmt.Println("Sent ACK (in response to RSR)")
 		}
 	})
 
