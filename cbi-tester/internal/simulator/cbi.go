@@ -354,27 +354,14 @@ func (s *CBISimulator) handleNACK(frame *protocol.Frame) {
 }
 
 // checkAndUpdateSequence 检查并更新序号
-// 1. 将发送序号变量的值复制到帧的发送序号字段
-// 2. 将接收确认序号变量的值复制到帧的确认序号字段
-// 3. 将收到的确认序号与发送序号变量对比，相等则发送序号变量递增1
-// 4. 将收到的发送序号与接收确认序号变量对比：
-//    - 差值=1：接收确认序号变量递增1后回复ACK
-//    - 差值=0：直接回复ACK
-//    - 其他：判定通信中断，断开连接
+// 规则：检查接收帧的发送序号是否正确
+// - 差值=1：正常帧，更新接收确认序号
+// - 差值=0：重复帧，回复ACK
+// - 其他：通信中断
+// 注意：sendSeq只在发送数据帧后递增，不在接收帧时递增
 func (s *CBISimulator) checkAndUpdateSequence(frame *protocol.Frame) bool {
 	s.seqMu.Lock()
 	defer s.seqMu.Unlock()
-
-	// 检查确认序号（对方确认了我发送的帧）
-	// 收到的确认序号与发送序号变量对比
-	// 注意：ACK帧的确认序号表示对方已确认的帧序号
-	if frame.AckSeq == s.sendSeq {
-		// 确认序号匹配，发送序号递增
-		s.sendSeq++
-		if s.sendSeq == 0 {
-			s.sendSeq = 1 // 序号从1开始，0无效
-		}
-	}
 
 	// 检查发送序号（对方发送的帧序号）
 	// 将收到的发送序号与接收确认序号变量对比
@@ -444,6 +431,46 @@ func (s *CBISimulator) sendFrame(frame *protocol.Frame) error {
 	return s.transport.Send(data)
 }
 
+// sendDataFrame 发送数据传送帧
+// 数据传送帧包括：FIR, SDIQ, SDI, SDCI, BCC, TSQ, TSD, RSR, ACQ, ACA
+// 发送后发送序号变量递增
+func (s *CBISimulator) sendDataFrame(frameType protocol.FrameType, data []byte) error {
+	s.seqMu.Lock()
+	// 数据帧：sendSeq填入当前发送序号变量的值
+	frame := &protocol.Frame{
+		HeaderLen: protocol.HeaderLen,
+		Type:      frameType,
+		SendSeq:   s.sendSeq,
+		AckSeq:    s.recvAckSeq,
+		Version:   protocol.Version,
+		Data:      data,
+	}
+
+	// 编码发送
+	encodedData, err := protocol.EncodeFrame(frame)
+	if err != nil {
+		s.seqMu.Unlock()
+		return err
+	}
+
+	log.Infof("Sending data frame: %s (seq=%d, ack=%d)", frameType, s.sendSeq, s.recvAckSeq)
+
+	err = s.transport.Send(encodedData)
+	if err != nil {
+		s.seqMu.Unlock()
+		return err
+	}
+
+	// 发送成功后，发送序号变量递增
+	s.sendSeq++
+	if s.sendSeq == 0 {
+		s.sendSeq = 1 // 序号0保留，从1开始
+	}
+	s.seqMu.Unlock()
+
+	return nil
+}
+
 // sendDC3 发送DC3连接确认
 func (s *CBISimulator) sendDC3() {
 	frame := &protocol.Frame{
@@ -454,22 +481,111 @@ func (s *CBISimulator) sendDC3() {
 	s.sendFrame(frame)
 }
 
-// sendACK 发送ACK
+// sendACK 发送ACK帧
+// 规则：ACK帧的发送序号固定保持最后一次发送数据传送帧的发送序号
+// 规则：ACK帧的确认序号填写最近接收到的正确数据传送帧的发送序号
+// 注意：sendSeq变量在发送数据帧后已递增，所以最后发送的数据帧序号是 sendSeq - 1
 func (s *CBISimulator) sendACK() error {
-	return s.sendFrame(&protocol.Frame{Type: protocol.ACK})
+	s.seqMu.Lock()
+
+	// ACK帧的发送序号 = 最后发送数据帧的序号
+	// sendSeq在发送数据帧后已递增，所以最后发送的数据帧序号是 sendSeq - 1
+	ackSendSeq := s.sendSeq - 1
+	if ackSendSeq == 0 {
+		ackSendSeq = 1 // 序号0保留，最小有效序号是1
+	}
+
+	// ACK帧的确认序号 = recvAckSeq（最近正确接收数据帧的发送序号）
+	frame := &protocol.Frame{
+		HeaderLen: protocol.HeaderLen,
+		Type:      protocol.ACK,
+		SendSeq:   ackSendSeq,  // 最后发送数据帧的序号
+		AckSeq:    s.recvAckSeq, // 确认序号变量
+		Version:   protocol.Version,
+	}
+
+	// 编码发送
+	data, err := protocol.EncodeFrame(frame)
+	if err != nil {
+		s.seqMu.Unlock()
+		return err
+	}
+
+	log.Infof("Sending ACK: seq=%d (last data frame seq), ack=%d", frame.SendSeq, frame.AckSeq)
+
+	err = s.transport.Send(data)
+	s.seqMu.Unlock()
+	return err
 }
 
-// sendNACK 发送NACK
+// sendNACK 发送NACK否定应答
+// NACK是控制帧，发送序号保持最后发送数据帧的序号
 func (s *CBISimulator) sendNACK() error {
-	return s.sendFrame(&protocol.Frame{Type: protocol.NACK})
+	s.seqMu.Lock()
+
+	// NACK帧的发送序号 = 最后发送数据帧的序号
+	ackSendSeq := s.sendSeq - 1
+	if ackSendSeq == 0 {
+		ackSendSeq = 1 // 序号0保留，最小有效序号是1
+	}
+
+	frame := &protocol.Frame{
+		HeaderLen: protocol.HeaderLen,
+		Type:      protocol.NACK,
+		SendSeq:   ackSendSeq,  // 最后发送数据帧的序号
+		AckSeq:    s.recvAckSeq,
+		Version:   protocol.Version,
+	}
+
+	// 编码发送
+	data, err := protocol.EncodeFrame(frame)
+	if err != nil {
+		s.seqMu.Unlock()
+		return err
+	}
+
+	log.Infof("Sending NACK: seq=%d, ack=%d", frame.SendSeq, frame.AckSeq)
+
+	err = s.transport.Send(data)
+	s.seqMu.Unlock()
+	return err
 }
 
-// sendVERROR 发送VERROR
+// sendVERROR 发送VERROR版本错误
+// VERROR是控制帧，发送序号保持最后发送数据帧的序号
 func (s *CBISimulator) sendVERROR() error {
-	return s.sendFrame(&protocol.Frame{Type: protocol.VERROR})
+	s.seqMu.Lock()
+
+	// VERROR帧的发送序号 = 最后发送数据帧的序号
+	ackSendSeq := s.sendSeq - 1
+	if ackSendSeq == 0 {
+		ackSendSeq = 1 // 序号0保留，最小有效序号是1
+	}
+
+	frame := &protocol.Frame{
+		HeaderLen: protocol.HeaderLen,
+		Type:      protocol.VERROR,
+		SendSeq:   ackSendSeq,  // 最后发送数据帧的序号
+		AckSeq:    s.recvAckSeq,
+		Version:   protocol.Version,
+	}
+
+	// 编码发送
+	data, err := protocol.EncodeFrame(frame)
+	if err != nil {
+		s.seqMu.Unlock()
+		return err
+	}
+
+	log.Infof("Sending VERROR: seq=%d, ack=%d", frame.SendSeq, frame.AckSeq)
+
+	err = s.transport.Send(data)
+	s.seqMu.Unlock()
+	return err
 }
 
 // sendRSR 发送RSR系统工作状态
+// RSR是数据传送帧，发送后序号递增
 func (s *CBISimulator) sendRSR() error {
 	s.mu.RLock()
 	role := s.roleState
@@ -478,13 +594,11 @@ func (s *CBISimulator) sendRSR() error {
 
 	// RSR数据：主备状态 + 控制模式
 	data := []byte{role, mode}
-	return s.sendFrame(&protocol.Frame{
-		Type: protocol.RSR,
-		Data: data,
-	})
+	return s.sendDataFrame(protocol.RSR, data)
 }
 
 // sendSDI 发送SDI完整站场数据
+// SDI是数据传送帧，发送后序号递增
 func (s *CBISimulator) sendSDI() error {
 	var data []byte
 	if s.stationMgr != nil {
@@ -495,13 +609,11 @@ func (s *CBISimulator) sendSDI() error {
 		// 使用随机数据
 		data = s.generateRandomSDIData()
 	}
-	return s.sendFrame(&protocol.Frame{
-		Type: protocol.SDI,
-		Data: data,
-	})
+	return s.sendDataFrame(protocol.SDI, data)
 }
 
 // sendSDCI 发送SDCI增量数据
+// SDCI是数据传送帧，发送后序号递增
 func (s *CBISimulator) sendSDCI() error {
 	var data []byte
 	if s.stationMgr != nil {
@@ -509,33 +621,27 @@ func (s *CBISimulator) sendSDCI() error {
 	} else {
 		data = s.generateRandomSDCIData()
 	}
-	return s.sendFrame(&protocol.Frame{
-		Type: protocol.SDCI,
-		Data: data,
-	})
+	return s.sendDataFrame(protocol.SDCI, data)
 }
 
 // sendFIR 发送FIR故障信息报告
+// FIR是数据传送帧，发送后序号递增
 func (s *CBISimulator) sendFIR() error {
 	data := s.generateFIRData()
-	return s.sendFrame(&protocol.Frame{
-		Type: protocol.FIR,
-		Data: data,
-	})
+	return s.sendDataFrame(protocol.FIR, data)
 }
 
 // sendACQ 发送ACQ自律控制请求
+// ACQ是数据传送帧，发送后序号递增
 func (s *CBISimulator) sendACQ() error {
 	data := []byte{ControlModeAuto} // 请求自律控制
-	return s.sendFrame(&protocol.Frame{
-		Type: protocol.ACQ,
-		Data: data,
-	})
+	return s.sendDataFrame(protocol.ACQ, data)
 }
 
 // sendTSQ 发送TSQ时间同步请求
+// TSQ是数据传送帧，发送后序号递增
 func (s *CBISimulator) sendTSQ() error {
-	return s.sendFrame(&protocol.Frame{Type: protocol.TSQ})
+	return s.sendDataFrame(protocol.TSQ, nil)
 }
 
 // === 数据生成方法 ===

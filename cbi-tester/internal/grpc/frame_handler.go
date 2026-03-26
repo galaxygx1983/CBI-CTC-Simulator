@@ -226,8 +226,9 @@ func (h *FrameHandler) SendDataFrame(frameType protocol.FrameType, buildData fun
 }
 
 // SendACK 发送ACK帧
-// ACK帧的发送序号保持最后发送数据传送帧的发送序号（sendSeq已在发送后递增，所以用sendSeq-1）
-// ACK帧的确认序号为最近接收到正确数据传送帧的发送序号
+// 规则：ACK帧的发送序号固定保持最后一次发送数据传送帧的发送序号
+// 规则：ACK帧的确认序号填写最近接收到的正确数据传送帧的发送序号
+// 注意：sendSeq变量在发送数据帧后已递增，所以最后发送的数据帧序号是 sendSeq - 1
 func (h *FrameHandler) SendACK() error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -236,26 +237,26 @@ func (h *FrameHandler) SendACK() error {
 		return errors.New("client is nil")
 	}
 
-	// ACK帧：sendSeq = 最后发送数据帧的序号（sendSeq已在发送后递增，所以用sendSeq）
-	// 但根据规则，ACK的sendSeq应该是"最后发送数据传送帧的发送序号"
-	// 由于sendSeq在发送数据帧后已递增，所以ACK的sendSeq应该是sendSeq（当前值，代表下一个要发送的序号）
-	// 实际上sendSeq变量保存的是"下一个要发送的序号"，所以ACK的sendSeq应该是sendSeq（当前值）
-	// 不对，让我重新理解：sendSeq变量保存的是"下一个要发送的数据帧序号"
-	// 所以ACK帧的sendSeq应该是sendSeq（表示最后成功发送的数据帧序号是sendSeq-1，但ACK帧本身不占用序号）
-	// 根据规则：ACK帧的发送序号保持最后发送数据传送帧的发送序号
-	// sendSeq变量在发送数据帧后已经递增，所以最后发送的数据帧序号是 sendSeq - 1
-	// 但如果sendSeq==1（初始状态），表示还没发送过数据帧，此时ACK的sendSeq应该是1（初始化后的值）
+	// ACK帧的发送序号 = 最后发送数据帧的序号
+	// sendSeq在发送数据帧后已递增，所以最后发送的数据帧序号是 sendSeq - 1
+	// 如果sendSeq == 1（初始状态），需要特殊处理：
+	//   - sendSeq初始化为1表示还没发送过数据帧
+	//   - 此时ACK的sendSeq应该是1（初始序号）
+	ackSendSeq := h.sendSeq - 1
+	if ackSendSeq == 0 {
+		ackSendSeq = 1 // 序号0保留，最小有效序号是1
+	}
 
 	// ACK帧的确认序号 = ackSeq（最近正确接收数据帧的发送序号）
 	frame := &protocol.Frame{
 		HeaderLen: HeaderLen,
 		Type:      protocol.ACK,
-		SendSeq:   h.sendSeq, // 保持当前发送序号变量值
-		AckSeq:    h.ackSeq,   // 确认序号变量
+		SendSeq:   ackSendSeq,  // 最后发送数据帧的序号
+		AckSeq:    h.ackSeq,    // 确认序号变量
 		Version:   Version,
 	}
 
-	log.Infof("SendACK: seq=%d, ack=%d", frame.SendSeq, frame.AckSeq)
+	log.Infof("SendACK: seq=%d (last data frame seq), ack=%d", frame.SendSeq, frame.AckSeq)
 
 	return h.client.SendFrame(frame)
 }
@@ -288,7 +289,8 @@ func (h *FrameHandler) SendDC3() error {
 }
 
 // SendFrame 发送控制帧（不需要序号控制）
-// 用于发送 ACK, NACK, VERROR 等控制帧
+// 用于发送 NACK, VERROR 等控制帧
+// 控制帧的发送序号保持最后发送数据帧的序号
 func (h *FrameHandler) SendFrame(frameType protocol.FrameType) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -297,16 +299,23 @@ func (h *FrameHandler) SendFrame(frameType protocol.FrameType) error {
 		return errors.New("client is nil")
 	}
 
-	// 控制帧：sendSeq保持当前值，ackSeq使用ackSeq变量
+	// 控制帧：发送序号 = 最后发送数据帧的序号
+	// sendSeq在发送数据帧后已递增，所以最后发送的数据帧序号是 sendSeq - 1
+	controlSendSeq := h.sendSeq - 1
+	if controlSendSeq == 0 {
+		controlSendSeq = 1 // 序号0保留，最小有效序号是1
+	}
+
+	// 控制帧：ackSeq使用ackSeq变量
 	frame := &protocol.Frame{
 		HeaderLen: HeaderLen,
 		Type:      frameType,
-		SendSeq:   h.sendSeq, // 保持当前发送序号变量值
-		AckSeq:    h.ackSeq,  // 确认序号变量
+		SendSeq:   controlSendSeq, // 最后发送数据帧的序号
+		AckSeq:    h.ackSeq,        // 确认序号变量
 		Version:   Version,
 	}
 
-	log.Infof("SendFrame: %s (seq=%d, ack=%d)", frameType, h.sendSeq, h.ackSeq)
+	log.Infof("SendFrame: %s (seq=%d, ack=%d)", frameType, controlSendSeq, h.ackSeq)
 
 	return h.client.SendFrame(frame)
 }
@@ -470,25 +479,13 @@ func (h *FrameHandler) handleControlFrame(frame *protocol.Frame) error {
 }
 
 // checkDataFrameSequence 数据帧序号检查
-// 规则6: 将帧中的确认序号与自己的发送序号变量比较，两值相等时认为收到了前次发送帧的确认信息，之后将自己的发送序号变量加1
 // 规则7: 将帧中的发送序号与自己的接收确认序号变量进行比较，发送序号比接收确认序号大1时，将接收确认序号变量加1
 // 规则8: 如果帧中的发送序号等于自己的接收确认序号，则认为发送方发送了重复的数据帧，仍向发送方发送确认信息但不再对接收到的数据进行处理
 // 规则9: 如果帧中的发送序号比自己的接收确认序号大于或等于2，则认为通信中断，CBI等待CTC重新初始化通信
+// 注意：sendSeq只在发送数据帧后递增，不在接收帧时递增
 func (h *FrameHandler) checkDataFrameSequence(frame *protocol.Frame) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-
-	// 规则6: 检查确认序号
-	// 将帧中的确认序号与自己的发送序号变量比较，两值相等时认为收到了前次发送帧的确认信息
-	// 之后将自己的发送序号变量加1
-	if frame.AckSeq == h.sendSeq {
-		// 收到确认，发送序号变量加1
-		h.sendSeq++
-		if h.sendSeq == 0 {
-			h.sendSeq = 1 // 序号0保留
-		}
-		log.Debugf("ACK confirmed: ackSeq=%d, sendSeq now=%d", frame.AckSeq, h.sendSeq)
-	}
 
 	// 规则7/8/9: 检查发送序号
 	// 将帧中的发送序号与自己的接收确认序号变量进行比较

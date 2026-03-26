@@ -138,8 +138,9 @@ func TestSequenceCheck(t *testing.T) {
 	if sim.recvAckSeq != 1 {
 		t.Errorf("Expected recvAckSeq 1, got %d", sim.recvAckSeq)
 	}
-	if sim.sendSeq != 2 {
-		t.Errorf("Expected sendSeq 2, got %d", sim.sendSeq)
+	// sendSeq不应在接收帧时递增，只在发送数据帧后递增
+	if sim.sendSeq != 1 {
+		t.Errorf("Expected sendSeq 1 (unchanged), got %d", sim.sendSeq)
 	}
 	sim.seqMu.Unlock()
 }
