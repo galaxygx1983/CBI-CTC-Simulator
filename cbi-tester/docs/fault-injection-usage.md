@@ -505,6 +505,4 @@ cbi-client connect -a localhost:50051 \
 
 ## 相关文档
 
-- [故障注入设计方案](fault-injection-design.md)
-- [故障注入实现计划](fault-injection-implementation-plan.md)
 - [CBI报文收发及通信规则说明](CBI报文收发及通信规则说明.txt)

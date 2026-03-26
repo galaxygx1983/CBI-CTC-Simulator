@@ -409,11 +409,14 @@ func (s *CBISimulator) disconnect() {
 // === 发送帧方法 ===
 
 // sendFrame 发送帧（核心发送逻辑）
+// 注意：此函数已弃用，请使用 sendDataFrame、sendACK、sendNACK、sendVERROR 或 sendDC3
+// 此函数会覆盖帧的序号，仅用于向后兼容
 func (s *CBISimulator) sendFrame(frame *protocol.Frame) error {
 	s.seqMu.Lock()
-	// 将发送序号变量复制到帧
+	// 警告：这里会覆盖帧的序号
+	// 对于控制帧（ACK/NACK/VERROR），应使用专门的发送函数
+	// 对于DC2/DC3，应使用专门的发送函数
 	frame.SendSeq = s.sendSeq
-	// 将接收确认序号变量复制到帧
 	frame.AckSeq = s.recvAckSeq
 	s.seqMu.Unlock()
 
@@ -426,6 +429,7 @@ func (s *CBISimulator) sendFrame(frame *protocol.Frame) error {
 		return err
 	}
 
+	log.Warnf("DEPRECATED: sendFrame called for %s, use specialized function instead", frame.Type)
 	log.Infof("Sending frame: %s (seq=%d, ack=%d)", frame.Type, frame.SendSeq, frame.AckSeq)
 
 	return s.transport.Send(data)
@@ -472,13 +476,31 @@ func (s *CBISimulator) sendDataFrame(frameType protocol.FrameType, data []byte) 
 }
 
 // sendDC3 发送DC3连接确认
+// DC3是特殊的控制帧，序号固定为0
 func (s *CBISimulator) sendDC3() {
+	s.seqMu.Lock()
+	// DC3发送后，发送序号置1，接收确认序号置0
+	s.sendSeq = 1
+	s.recvAckSeq = 0
+	s.seqMu.Unlock()
+
 	frame := &protocol.Frame{
-		Type:    protocol.DC3,
-		SendSeq: 0x00, // DC3帧序号为0
-		AckSeq:  0x00,
+		HeaderLen: protocol.HeaderLen,
+		Type:      protocol.DC3,
+		SendSeq:   0x00, // DC3帧序号固定为0
+		AckSeq:    0x00, // DC3帧确认序号固定为0
+		Version:   protocol.Version,
 	}
-	s.sendFrame(frame)
+
+	// 编码发送（不使用sendFrame，避免序号被覆盖）
+	data, err := protocol.EncodeFrame(frame)
+	if err != nil {
+		log.Warnf("Failed to encode DC3: %v", err)
+		return
+	}
+
+	log.Info("Sending DC3: seq=0, ack=0")
+	s.transport.Send(data)
 }
 
 // sendACK 发送ACK帧
