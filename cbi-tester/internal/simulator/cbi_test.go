@@ -186,7 +186,7 @@ func TestHandleACK(t *testing.T) {
 	defer sim.Stop()
 
 	// 测试ACK计数和响应
-	// ACK=1 应该发送SDI
+	// ACK=2 应该发送SDI
 	sim.ackCount = 0
 	frame := &protocol.Frame{Type: protocol.ACK}
 	sim.handleACK(frame)
@@ -197,7 +197,7 @@ func TestHandleACK(t *testing.T) {
 	}
 	sim.mu.Unlock()
 
-	// ACK=2 应该发送ACQ
+	// ACK=3 应该发送ACQ
 	sim.handleACK(frame)
 	sim.mu.Lock()
 	if sim.ackCount != 2 {

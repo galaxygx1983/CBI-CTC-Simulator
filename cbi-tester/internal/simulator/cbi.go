@@ -265,8 +265,8 @@ func (s *CBISimulator) handleRSR(frame *protocol.Frame) {
 
 // handleACK 处理ACK帧
 // ACK计数器递增1后判断：
-// - ACK计数器=1：回复SDI
-// - ACK计数器=2：回复ACQ
+// - ACK计数器=2：回复SDI
+// - ACK计数器=3：回复ACQ
 // - ACK计数器=10：回复TSQ
 // - ACK计数器>10且为3的倍数：回复SDCI
 // - ACK计数器>10且为5的倍数：回复FIR
@@ -280,12 +280,12 @@ func (s *CBISimulator) handleACK(frame *protocol.Frame) {
 	log.Debugf("ACK count: %d", count)
 
 	switch {
-	case count == 1:
-		// 第一次ACK：回复SDI
+	case count == 2:
+		// 第二次ACK：回复SDI
 		s.sendSDI()
 
-	case count == 2:
-		// 第二次ACK：回复ACQ
+	case count == 3:
+		// 第三次ACK：回复ACQ
 		s.sendACQ()
 
 	case count == 10:
